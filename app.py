@@ -17,7 +17,7 @@ user_state = {}
 # ※重要：検証ボタンではトークンが有効期限切れになっていることも多々あります。
 # もしこれでエラーが出る場合は、LINE Developers から新しいアクセストークンを取得してください。
 # (環境変数から取るのがベストですが、一時的にはここに書き換えても OK です)
-LINE_ACCESS_TOKEN = "YPKNsFLF+o3aSlKEEt3da3FE4CgG8vRfNiO6z6Ha5i6Lg9DVAly6n8EWumFNqOqW4skWE66fFG5VeQKi3UU2NnzGUD86uIcVoOyIDRKi7b+YDcIlN5DQ39UFyc/uHr+SeYFGlUb42WsQpz8pATr6GQdB04t89/1O/w1cDnyilFU="
+LINE_ACCESS_TOKEN = "w3SE5pZHgumydKAhwamiPJ4rJ1LpTFq6jGiTQAyVejlyEGSD60uBGUZWfaWZZJhF4skWE66fFG5VeQKi3UU2NnzGUD86uIcVoOyIDRKi7b/6vKWC7IaIODe78mY9Pk66GWO0BJoFOMlZjSFtn/h+egdB04t89/1O/w1cDnyilFU="
 
 def reply_message(reply_token, text):
     """返信メッセージを送信する関数（エラーが起きないよう厳密に処理）"""
