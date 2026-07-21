@@ -32,13 +32,14 @@ def webhook():
     body = request.json
 
     # ★LINEの「接続確認」は events が無いので即200を返す（最重要）
-    if "events" not in body:
+    if not body or "events" not in body:
         return "OK"
 
     event = body["events"][0]
     user_id = event["source"]["userId"]
     reply_token = event["replyToken"]
     text = event["message"]["text"]
+
 
     # 初回メッセージ → 入力開始
     if user_id not in user_state:
