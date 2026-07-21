@@ -8,7 +8,7 @@ user_state = {}
 
 # LINE のアクセストークン設定
 # 環境変数か、コード内の定数として指定してください
-LINE_ACCESS_TOKEN = os.environ.get("LINE_ACCESS_TOKEN", "")
+LINE_ACCESS_TOKEN = os.environ.get("LINE_ACCESS_TOKEN", "YPKNsFLF+o3aSlKEEt3da3FE4CgG8vRfNiO6z6Ha5i6Lg9DVAly6n8EWumFNqOqW4skWE66fFG5VeQKi3UU2NnzGUD86uIcVoOyIDRKi7b+YDcIlN5DQ39UFyc/uHr+SeYFGlUb42WsQpz8pATr6GQdB04t89/1O/w1cDnyilFU=")
 
 def reply_message(reply_token, text):
     """返信メッセージを送信する関数"""
