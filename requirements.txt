@@ -1,2 +1,4 @@
-Flask
-gunicorn
+Flask==3.0.0
+requests==2.31.0
+gunicorn==21.2.0
+python-dotenv==1.0.0  # 環境変数の読み込み用（トークン管理にも有効）
