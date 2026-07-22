@@ -31,14 +31,18 @@ def health():
 def webhook():
     body = request.json
 
-    # ★LINEの「接続確認」は events が無いので即200を返す（最重要）
-    if "events" not in body:
+    # ★LINEの「接続確認」は events が無い or 空なので即200を返す（最重要）
+    if not body or "events" not in body or len(body["events"]) == 0:
         return "OK"
 
     event = body["events"][0]
     user_id = event["source"]["userId"]
     reply_token = event["replyToken"]
-    text = event["message"]["text"]
+
+    # ★message が無い場合に備えて安全に取り出す
+    message = event.get("message", {})
+    text = message.get("text", "")
+
 
     # 初回メッセージ → 入力開始
     if user_id not in user_state:
