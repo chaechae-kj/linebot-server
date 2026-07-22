@@ -1,31 +1,28 @@
 from flask import Flask, request, Response, jsonify
 import os
+import json
 try:
     import requests 
 except ImportError:
-    print("requests module not found. Installing...")
-    # Render では通常 pip install requests が事前に行われていますが、念のため。
+    print("⚠️ エラー：requests ライブラリが見つかりません。\npip install requests を実行してください。")
     pass 
 
 app = Flask(__name__)
 
-# ユーザーごとの状態を保存する辞書（本番では DB に移す）
+# ユーザーごとの状態を保存する辞書
 user_state = {}
 
-# LINE のアクセストークン設定
-# Render の Environment Variables で 'LINE_ACCESS_TOKEN' を設定していることを確認してください
+# LINE のアクセストークン設定（Render の環境変数 'LINE_ACCESS_TOKEN' から取得）
 TOKEN_ENV = os.environ.get("LINE_ACCESS_TOKEN") 
 if not TOKEN_ENV:
-    # 環境変数がなければ起動時エラーになりにくくするためにデバッグトークンを置くか、ここは空にします。
-    # 検証ボタンを使う場合は、Render の設定でトークンを設定するか、ここで代入してください。
-    LINE_ACCESS_TOKEN = "YOUR_TOKEN_HERE" 
+    # 本番運用時は必ず Render 設定でトークンを指定してください
+    LINE_ACCESS_TOKEN = None 
 else:
     LINE_ACCESS_TOKEN = TOKEN_ENV
 
 def reply_message(reply_token, text):
     """返信メッセージを送信する関数"""
     if not LINE_ACCESS_TOKEN:
-        # トークンがない場合は何もしない（200 返却）
         return Response("OK", status=200)
 
     url = "https://api.line.me/v2/bot/message/reply"
@@ -43,30 +40,54 @@ def reply_message(reply_token, text):
         requests.post(url, headers=headers, json=body)
     except Exception as e:
         # 通信エラーでもサーバーは落ちないよう無視（またはログ出力）
-        print(f"Reply failed (ignored): {e}")
+        # print(f"Reply failed (ignored): {e}") 
+        return Response("OK", status=200)
 
 @app.route("/", methods=["GET"])
 def health():
     return Response("OK", status=200)
 
+# ★★ データ公開エンドポイント ★★
+@app.route("/expenses")
+def get_expenses_json():
+    """
+    PC の統計処理用：保存されたデータを JSON 形式で返す API です。
+    URL: https://あなたのアプリURL.onrender.com/expenses
+    """
+    filename = 'expenses_data.json'
+    
+    try:
+        # ファイルが存在しない場合は空リストを返す
+        if not os.path.exists(filename):
+            return jsonify([])
+        
+        with open(filename, mode='r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        return Response(
+            json.dumps(data), 
+            mimetype="application/json"
+        )
+    except Exception as e:
+        print(f"JSON リードエラー：{e}")
+        return jsonify([])
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # ★最重要：JSON パース失敗をキャッチ
+    # JSON パース失敗をキャッチ
     try:
         body = request.get_json()
-    except Exception as e:
-        # JSON が来なかったら 200 で OK 返す（接続確認用）
+    except Exception:
         return Response("OK", status=200)
 
-    # ★最重要：events リストが空なら即終了（接続確認時など）
+    # ★重要：イベントがない場合は即 200 (接続確認時など)
     if not body or "events" not in body:
         return Response("OK", status=200)
     
     events = body["events"]
     
-    # ★エラー回避：イベントリストが空なら 200
+    # イベントリストが空なら 200
     if len(events) == 0:
-        print("[Debug] No events found. Returning OK.")
         return Response("OK", status=200)
 
     event = events[0]
@@ -82,8 +103,7 @@ def webhook():
     try:
         text = event["message"]["text"]
     except (KeyError, TypeError):
-        # テキストメッセージが来なかった場合（画像だけの場合など）
-        # 今回は「テキスト必須」という前提なので、処理をスキップして 200 を返す
+        # テキストメッセージが来なかった場合（画像だけの場合など）、処理をスキップ
         return Response("OK", status=200)
 
     # ユーザーの状態管理初期化・更新
@@ -109,7 +129,6 @@ def webhook():
             user_state[user_id]["step"] = "image"
             reply_message(reply_token, f"{payer_map[normalized_input]} さんの出費を入力します。\nレシート画像を送るか「なし」と入力してください。")
         else:
-            # 誤った選択肢の場合
             reply_message(reply_token, "1〜3（または①〜③）で選択してください。\n例：① または 1\n(画像送信前にはテキスト選択が必要です)")
 
     # ② 画像・備考入力処理
@@ -133,28 +152,56 @@ def webhook():
         user_state[user_id]["step"] = "usage"
         reply_message(reply_token, f"{text}円で保存します。\n用途を入力してください。")
 
-    # ④ 用途入力処理（完了）
+    # ④ 用途入力処理（完了）＋ ★★ データ保存 ★★
     elif step == "usage":
         user_state[user_id]["usage"] = text
         
-        data = user_state.pop(user_id, None)
-        
-        if data:
+        # データ構造の作成
+        data_to_save = {
+            "payer": user_state[user_id].get("payer"),
+            "image": user_state[user_id].get("image", ""),
+            "amount": user_state[user_id].get("amount"),
+            "usage": user_state[user_id].get("usage"),
+            # 日時は保存しないか、必要なら追加してください
+        }
+
+        # JSON ファイルに書き込みロジック
+        filename = 'expenses_data.json'
+        try:
+            # ファイルが存在しない場合は空リストで初期化
+            if not os.path.exists(filename):
+                with open(filename, mode='w', encoding='utf-8') as f:
+                    json.dump([], f)
+            
+            # 既存データの読み込みと追加
+            with open(filename, mode='r', encoding='utf-8') as f:
+                records = json.load(f)
+            records.append(data_to_save)
+            
+            # 書き戻し
+            with open(filename, mode='w', encoding='utf-8') as f:
+                json.dump(records, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"保存エラー：{e}")
+
+        # ユーザーの状態リセット
+        user_state.pop(user_id, None)
+
+        if data_to_save:
             summary = (
                 f"以下の内容で入力完了しました。\n"
-                f"【精算者】{data['payer']}\n"
-                f"【画像備考】{data['image'] or 'なし'}\n"  
-                f"【料金】{data['amount']}円\n"
-                f"【用途】{data['usage']}"
+                f"【精算者】{data_to_save['payer']}\n"
+                f"【画像備考】{data_to_save['image'] or 'なし'}\n"  
+                f"【料金】{data_to_save['amount']}円\n"
+                f"【用途】{data_to_save['usage']}"
             )
             reply_message(reply_token, summary)
-        
-        # ステップのリセット（次の購入時に再利用するため、辞書から消去済みなので OK）
 
     return Response("OK", status=200)
 
+# ★★ デプロイ時の注意 ★★
 if __name__ == "__main__":
-    # Render では gunicorn が使うので debug=True は外すのが推奨ですが、
-    # ローカルテスト時は有効にします。Render でデプロイする際はこれを変更するか、
-    # requirements.txt に gunicorn を入れて動かしてください。
-    app.run(debug=False, port=8000)
+    # Render では gunicorn が使うため、この部分はコメントアウトするか削除することをお勧めします。
+    # ローカルでのテスト用のみ有効にします。
+    # app.run(debug=True, port=8000)
+    pass 
