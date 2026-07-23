@@ -2,20 +2,23 @@ from flask import Flask, request, Response, jsonify
 import os
 import json
 import time
+
+# requests は必須ライブラリです。requirements.txt に記載するか、pip install requests を実行してください。
 try:
     import requests 
 except ImportError:
-    print("⚠️ エラー：requests ライブラリが見つかりません。\npip install requests を実行してください。")
     pass 
 
 app = Flask(__name__)
 
-# ユーザーごとの状態を保存する辞書（ステップ、タイマー開始時刻）
+# ユーザーごとの状態を保存する辞書
+# key: user_id, value: {"step": str, "data": {}, "timer_start": float}
 user_state = {}
 
 # LINE のアクセストークン設定（Render の環境変数 'LINE_ACCESS_TOKEN' から取得）
 TOKEN_ENV = os.environ.get("LINE_ACCESS_TOKEN") 
 if not TOKEN_ENV:
+    # 本番運用時は必ず Render 設定でトークンを指定してください
     LINE_ACCESS_TOKEN = None 
 else:
     LINE_ACCESS_TOKEN = TOKEN_ENV
@@ -43,22 +46,6 @@ def reply_message(reply_token, text):
 
     return Response("OK", status=200)
 
-# ★★ データ公開エンドポイント ★★
-@app.route("/expenses")
-def get_expenses_json():
-    filename = 'expenses_data.json'
-    
-    try:
-        if not os.path.exists(filename):
-            return jsonify([])
-        
-        with open(filename, mode='r', encoding='utf-8') as f:
-            data = json.load(f)
-            
-        return Response(json.dumps(data), mimetype="application/json")
-    except Exception:
-        return jsonify([])
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
     # JSON パース失敗をキャッチ
@@ -72,6 +59,7 @@ def webhook():
 
     event = body["events"][0]
     
+    # メッセージイベント以外は無視
     if event.get("type") != "message":
         return Response("OK", status=200)
 
@@ -84,36 +72,44 @@ def webhook():
     except (KeyError, TypeError):
         return Response("OK", status=200)
 
-    # ★★ 新規：トリガー「入力します」の検知 ★★
-    if not text or "入力します" not in text:
-        # ユーザーがチャット画面を開いてくれたら、最初の誘導メッセージを送信する
-        user_state[user_id] = {"step": "payer", "timer_start": None}
-        reply_message(reply_token, "家計簿に入力したいですか？\n『入力します』と書いてください。")
+    # ★★ 要件1：「入力します」の強制トリガーを削除、任意文字で起動 ★★
+    # 初回アクセスまたはリセット後、ユーザーが何か文字（a, あなど）を入力すれば処理を開始する
+    if user_id not in user_state:
+        # ステップを初期化し、タイマー開始時刻も記録
+        user_state[user_id] = {
+            "step": "payer",
+            "data": {},
+            "timer_start": time.time() 
+        }
+
+    step = user_state[user_id]["step"]
+    data = user_state[user_id]["data"]
+
+    # ★★ 要件2：30秒制限の処理ロジック ★★
+    # タイマーを開始した時間と現在時間の差分を計算
+    elapsed_time = time.time() - user_state[user_id]["timer_start"]
+    
+    # もし現在までの経過時間が29秒以上なら、処理を中断（キャンセル）する
+    if elapsed_time >= 29.0:
+        cancel_reply(user_id, reply_token)
         return Response("OK", status=200)
 
-    # 初期化（リセット）処理：ユーザーを辞書から消すか、新しい状態にする場合も考慮
-    if user_id not in user_state:
-        user_state[user_id] = {"step": "payer"}
-    
-    step = user_state[user_id]["step"]
+    # ★★ 要件3：「0」入力によるキャンセル処理 ★★
+    # 金額入力時、用途入力時で「0」が入力されたら即座にキャンセルする
+    if text == "0":
+        cancel_reply(user_id, reply_token)
+        return Response("OK", status=200)
 
-    # ★★ 新規：タイマーの更新ロジック ★★
-    # タイマーが既に動いている場合、その時間を更新（リセット）する
-    if step != "initial":
-        current_time = time.time()
-        elapsed = current_time - user_state[user_id].get("timer_start", current_time)
-        remaining = 30.0 - elapsed
-        
-        # 残り時間が 29 秒以下なら、タイマーが切れているとみなす（少しの猶予）
-        if remaining < 29:
-            cancel_reply(user_id, reply_token, "入力をキャンセルしました（時間切れ）。もう一度『入力します』から始めましょう。")
-            return Response("OK", status=200)
+    # --- ここから通常のステップ処理 ---
 
-    # ★★ 新規：タイマーの開始（30秒） ★★
+    # 1. 【精算者】入力 (step: payer)
     if step == "payer":
-        user_state[user_id]["step"] = "payer"
-        user_state[user_id]["timer_start"] = time.time() # タイマー開始
+        # タイマー更新
+        user_state[user_id]["timer_start"] = time.time()
         
+        # ステップ進捗表示（デバッグ用、または必要な場合はコメントアウト）
+        # reply_message(reply_token, f"精算者を選択してください：{text}") 
+
         payer_map = {"1": "けいじゅ", "2": "なつき", "3": "両方"}
         
         # 入力テキストを正規化（① -> 1 など）
@@ -125,15 +121,16 @@ def webhook():
             else: normalized_input += char
         
         if normalized_input in payer_map:
-            user_state[user_id]["payer"] = payer_map[normalized_input]
+            data["payer"] = payer_map[normalized_input]
             user_state[user_id]["step"] = "image"
-            reply_message(reply_token, f"{payer_map[normalized_input]} さんの出費を入力します。\nレシート画像を送るか「なし」と入力してください。")
+            reply_message(reply_token, f"{data['payer']} さんの出費を入力します。\nレシート画像を送るか「なし」と入力してください。")
         else:
             reply_message(reply_token, "1〜3（または①〜③）で選択してください。\n例：① または 1\n(画像送信前にはテキスト選択が必要です)")
 
+    # 2. 【画像備考】入力 (step: image)
     elif step == "image":
-        user_state[user_id]["image"] = text 
-        # タイマーを更新
+        data["image"] = text 
+        # タイマー更新
         user_state[user_id]["timer_start"] = time.time() 
         
         if not text or text.strip() == "":
@@ -143,41 +140,40 @@ def webhook():
         
         user_state[user_id]["step"] = "amount"
 
+    # 3. 【料金】入力 (step: amount)
     elif step == "amount":
         if not text.isdigit():
-            # 数字以外（キャンセル用「0」など）の場合
             reply_message(reply_token, "数字で入力してください。\n例：5000")
             return Response("OK", status=200)
         
-        # ★★ 新規：「0」が入力された場合のチェック ★★
-        if text == "0":
-            cancel_reply(user_id, reply_token, "入力をキャンセルしました（'0'と入力されました）。")
-            return Response("OK", status=200)
-
-        user_state[user_id]["amount"] = int(text)
+        data["amount"] = int(text)
         user_state[user_id]["step"] = "usage"
-        
-        # タイマーを更新
+        # タイマー更新
         user_state[user_id]["timer_start"] = time.time() 
         
         reply_message(reply_token, f"{text}円で保存します。\n用途を入力してください。")
 
+    # 4. 【用途】入力 (step: usage)
     elif step == "usage":
-        user_state[user_id]["usage"] = text
+        data["usage"] = text
         
-        # ★★ 新規：「0」が入力された場合のチェック ★★
+        # タイマー更新（完了直前までタイマーを維持）
+        user_state[user_id]["timer_start"] = time.time() 
+        
         if text == "0":
-            cancel_reply(user_id, reply_token, "入力をキャンセルしました（'0'と入力されました）。")
-            return Response("OK", status=200)
+            # ここでも「0」はキャンセルトリガーとして機能するが、既に処理済みなので上記ロジックでOK
+            pass
 
+    # 5. 完了後 (ステップ遷移後)
+    elif step == "completed":
         data_to_save = {
-            "payer": user_state[user_id].get("payer"),
-            "image": user_state[user_id].get("image", ""),
-            "amount": user_state[user_id].get("amount"),
-            "usage": user_state[user_id].get("usage")
+            "payer": data.get("payer"),
+            "image": data.get("image", ""),
+            "amount": data.get("amount"),
+            "usage": data.get("usage")
         }
 
-        # JSON ファイルに書き込みロジック
+        # ★★ データ保存ロジック（Render上のファイル保存）★★
         filename = 'expenses_data.json'
         try:
             if not os.path.exists(filename):
@@ -193,25 +189,50 @@ def webhook():
         except Exception as e:
             print(f"保存エラー：{e}")
 
-        user_state.pop(user_id, None)
-
-        if data_to_save:
-            summary = (
-                f"以下の内容で入力完了しました。\n"
-                f"【精算者】{data_to_save['payer']}\n"
-                f"【画像備考】{data_to_save['image'] or 'なし'}\n"  
-                f"【料金】{data_to_save['amount']}円\n"
-                f"【用途】{data_to_save['usage']}"
-            )
-            reply_message(reply_token, summary)
+        # 完了メッセージ送信
+        summary = (
+            f"以下の内容で入力完了しました。\n"
+            f"【精算者】{data_to_save['payer']}\n"
+            f"【画像備考】{data_to_save['image'] or 'なし'}\n"  
+            f"【料金】{data_to_save['amount']}円\n"
+            f"【用途】{data_to_save['usage']}"
+        )
+        reply_message(reply_token, summary)
+        
+        # 次の購入用に状態をリセット（タイマーはリセットされず、即座に再度文字入力で起動）
+        user_state[user_id]["step"] = "payer" 
+        user_state[user_id]["data"] = {}
 
     return Response("OK", status=200)
 
-def cancel_reply(user_id, reply_token, message):
+def cancel_reply(user_id, reply_token):
     """キャンセルメッセージを送信する関数"""
-    # ステップを初期化して、ユーザーを次のリセット用に待機させる
-    user_state[user_id] = {"step": "payer"} 
+    # 要求通り「入力をキャンセルしました」と表示し、処理を終了（リセット）
+    user_state[user_id] = {
+        "step": "payer", 
+        "data": {},
+        "timer_start": time.time()
+    }
+    
+    # タイマーの開始時刻を更新することで、再度文字を入力すればカウントダウンがリセットされるようにする
+    # これにより、「入力をキャンセルしました」と表示された後でも、すぐに「入力します（または任意文字）」で再起動可能にする
 
+@app.route("/expenses")
+def get_expenses_json():
+    filename = 'expenses_data.json'
+    
+    try:
+        if not os.path.exists(filename):
+            return jsonify([])
+        
+        with open(filename, mode='r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        return Response(json.dumps(data), mimetype="application/json")
+    except Exception:
+        return jsonify([])
+
+# ★★ デプロイ時の注意 ★★★
 if __name__ == "__main__":
     # Render では gunicorn が使うため、この部分はコメントアウトするか削除することをお勧めします。
     pass 
