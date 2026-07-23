@@ -1,6 +1,7 @@
 from flask import Flask, request, Response, jsonify
 import os
 import json
+import time
 try:
     import requests 
 except ImportError:
@@ -9,13 +10,12 @@ except ImportError:
 
 app = Flask(__name__)
 
-# ユーザーごとの状態を保存する辞書
+# ユーザーごとの状態を保存する辞書（ステップ、タイマー開始時刻）
 user_state = {}
 
 # LINE のアクセストークン設定（Render の環境変数 'LINE_ACCESS_TOKEN' から取得）
 TOKEN_ENV = os.environ.get("LINE_ACCESS_TOKEN") 
 if not TOKEN_ENV:
-    # 本番運用時は必ず Render 設定でトークンを指定してください
     LINE_ACCESS_TOKEN = None 
 else:
     LINE_ACCESS_TOKEN = TOKEN_ENV
@@ -38,38 +38,25 @@ def reply_message(reply_token, text):
     }
     try:
         requests.post(url, headers=headers, json=body)
-    except Exception as e:
-        # 通信エラーでもサーバーは落ちないよう無視（またはログ出力）
-        # print(f"Reply failed (ignored): {e}") 
-        return Response("OK", status=200)
+    except Exception:
+        pass # 通信エラーは無視（サーバー落ちさせない）
 
-@app.route("/", methods=["GET"])
-def health():
     return Response("OK", status=200)
 
 # ★★ データ公開エンドポイント ★★
 @app.route("/expenses")
 def get_expenses_json():
-    """
-    PC の統計処理用：保存されたデータを JSON 形式で返す API です。
-    URL: https://あなたのアプリURL.onrender.com/expenses
-    """
     filename = 'expenses_data.json'
     
     try:
-        # ファイルが存在しない場合は空リストを返す
         if not os.path.exists(filename):
             return jsonify([])
         
         with open(filename, mode='r', encoding='utf-8') as f:
             data = json.load(f)
             
-        return Response(
-            json.dumps(data), 
-            mimetype="application/json"
-        )
-    except Exception as e:
-        print(f"JSON リードエラー：{e}")
+        return Response(json.dumps(data), mimetype="application/json")
+    except Exception:
         return jsonify([])
 
 @app.route("/webhook", methods=["POST"])
@@ -80,19 +67,11 @@ def webhook():
     except Exception:
         return Response("OK", status=200)
 
-    # ★重要：イベントがない場合は即 200 (接続確認時など)
-    if not body or "events" not in body:
-        return Response("OK", status=200)
-    
-    events = body["events"]
-    
-    # イベントリストが空なら 200
-    if len(events) == 0:
+    if not body or "events" not in body or len(body["events"]) == 0:
         return Response("OK", status=200)
 
-    event = events[0]
+    event = body["events"][0]
     
-    # メッセージイベント以外は無視（ただし 200 返却）
     if event.get("type") != "message":
         return Response("OK", status=200)
 
@@ -103,17 +82,38 @@ def webhook():
     try:
         text = event["message"]["text"]
     except (KeyError, TypeError):
-        # テキストメッセージが来なかった場合（画像だけの場合など）、処理をスキップ
         return Response("OK", status=200)
 
-    # ユーザーの状態管理初期化・更新
+    # ★★ 新規：トリガー「入力します」の検知 ★★
+    if not text or "入力します" not in text:
+        # ユーザーがチャット画面を開いてくれたら、最初の誘導メッセージを送信する
+        user_state[user_id] = {"step": "payer", "timer_start": None}
+        reply_message(reply_token, "家計簿に入力したいですか？\n『入力します』と書いてください。")
+        return Response("OK", status=200)
+
+    # 初期化（リセット）処理：ユーザーを辞書から消すか、新しい状態にする場合も考慮
     if user_id not in user_state:
         user_state[user_id] = {"step": "payer"}
     
     step = user_state[user_id]["step"]
-    
-    # ① 精算者選択処理
+
+    # ★★ 新規：タイマーの更新ロジック ★★
+    # タイマーが既に動いている場合、その時間を更新（リセット）する
+    if step != "initial":
+        current_time = time.time()
+        elapsed = current_time - user_state[user_id].get("timer_start", current_time)
+        remaining = 30.0 - elapsed
+        
+        # 残り時間が 29 秒以下なら、タイマーが切れているとみなす（少しの猶予）
+        if remaining < 29:
+            cancel_reply(user_id, reply_token, "入力をキャンセルしました（時間切れ）。もう一度『入力します』から始めましょう。")
+            return Response("OK", status=200)
+
+    # ★★ 新規：タイマーの開始（30秒） ★★
     if step == "payer":
+        user_state[user_id]["step"] = "payer"
+        user_state[user_id]["timer_start"] = time.time() # タイマー開始
+        
         payer_map = {"1": "けいじゅ", "2": "なつき", "3": "両方"}
         
         # 入力テキストを正規化（① -> 1 など）
@@ -131,9 +131,10 @@ def webhook():
         else:
             reply_message(reply_token, "1〜3（または①〜③）で選択してください。\n例：① または 1\n(画像送信前にはテキスト選択が必要です)")
 
-    # ② 画像・備考入力処理
     elif step == "image":
         user_state[user_id]["image"] = text 
+        # タイマーを更新
+        user_state[user_id]["timer_start"] = time.time() 
         
         if not text or text.strip() == "":
             reply_message(reply_token, "料金を入力してください。\n(※画像ファイルはテキストとして扱えないため、備考欄に'なし'と入力してください)")
@@ -142,49 +143,56 @@ def webhook():
         
         user_state[user_id]["step"] = "amount"
 
-    # ③ 金額入力処理
     elif step == "amount":
         if not text.isdigit():
+            # 数字以外（キャンセル用「0」など）の場合
             reply_message(reply_token, "数字で入力してください。\n例：5000")
             return Response("OK", status=200)
         
+        # ★★ 新規：「0」が入力された場合のチェック ★★
+        if text == "0":
+            cancel_reply(user_id, reply_token, "入力をキャンセルしました（'0'と入力されました）。")
+            return Response("OK", status=200)
+
         user_state[user_id]["amount"] = int(text)
         user_state[user_id]["step"] = "usage"
+        
+        # タイマーを更新
+        user_state[user_id]["timer_start"] = time.time() 
+        
         reply_message(reply_token, f"{text}円で保存します。\n用途を入力してください。")
 
-    # ④ 用途入力処理（完了）＋ ★★ データ保存 ★★
     elif step == "usage":
         user_state[user_id]["usage"] = text
         
-        # データ構造の作成
+        # ★★ 新規：「0」が入力された場合のチェック ★★
+        if text == "0":
+            cancel_reply(user_id, reply_token, "入力をキャンセルしました（'0'と入力されました）。")
+            return Response("OK", status=200)
+
         data_to_save = {
             "payer": user_state[user_id].get("payer"),
             "image": user_state[user_id].get("image", ""),
             "amount": user_state[user_id].get("amount"),
-            "usage": user_state[user_id].get("usage"),
-            # 日時は保存しないか、必要なら追加してください
+            "usage": user_state[user_id].get("usage")
         }
 
         # JSON ファイルに書き込みロジック
         filename = 'expenses_data.json'
         try:
-            # ファイルが存在しない場合は空リストで初期化
             if not os.path.exists(filename):
                 with open(filename, mode='w', encoding='utf-8') as f:
                     json.dump([], f)
             
-            # 既存データの読み込みと追加
             with open(filename, mode='r', encoding='utf-8') as f:
                 records = json.load(f)
             records.append(data_to_save)
             
-            # 書き戻し
             with open(filename, mode='w', encoding='utf-8') as f:
                 json.dump(records, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"保存エラー：{e}")
 
-        # ユーザーの状態リセット
         user_state.pop(user_id, None)
 
         if data_to_save:
@@ -199,9 +207,11 @@ def webhook():
 
     return Response("OK", status=200)
 
-# ★★ デプロイ時の注意 ★★
+def cancel_reply(user_id, reply_token, message):
+    """キャンセルメッセージを送信する関数"""
+    # ステップを初期化して、ユーザーを次のリセット用に待機させる
+    user_state[user_id] = {"step": "payer"} 
+
 if __name__ == "__main__":
     # Render では gunicorn が使うため、この部分はコメントアウトするか削除することをお勧めします。
-    # ローカルでのテスト用のみ有効にします。
-    # app.run(debug=True, port=8000)
     pass 
