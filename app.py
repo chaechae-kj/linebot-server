@@ -3,7 +3,6 @@ import os
 import json
 import time
 
-# requests は必須ライブラリです。requirements.txt に記載するか、pip install requests を実行してください。
 try:
     import requests 
 except ImportError:
@@ -11,10 +10,8 @@ except ImportError:
 
 app = Flask(__name__)
 
-# ユーザーごとの状態を保存する辞書
 user_state = {}
 
-# LINE のアクセストークン設定（Render の環境変数 'LINE_ACCESS_TOKEN' から取得）
 TOKEN_ENV = os.environ.get("LINE_ACCESS_TOKEN") 
 if not TOKEN_ENV:
     LINE_ACCESS_TOKEN = None 
@@ -22,7 +19,7 @@ else:
     LINE_ACCESS_TOKEN = TOKEN_ENV
 
 def reply_message(reply_token, text):
-    """返信メッセージを送信する関数"""
+    """返信メッセージを送信する関数（通信失敗時もエラー表示せず処理を継続）"""
     if not LINE_ACCESS_TOKEN:
         return Response("OK", status=200)
 
@@ -38,11 +35,14 @@ def reply_message(reply_token, text):
         ]
     }
     try:
+        # 通信を送信し、成功した場合のみレスポンスを返す
         requests.post(url, headers=headers, json=body)
-    except Exception:
-        pass # 通信エラーは無視（サーバー落ちさせない）
-
-    return Response("OK", status=200)
+        return Response("OK", status=200)
+    except Exception as e:
+        # 通信エラーが発生しても、サーバーは落ちないよう「OK」として処理を継続します。
+        # これにより、ユーザー側にはエラーが出ず、システムは安定稼働します。
+        print(f"⚠️ LINE API 通信失敗 (無視): {e}")
+        return Response("OK", status=200)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -73,8 +73,6 @@ def webhook():
         user_state[user_id] = {
             "step": "payer",
             "data": {},
-            # タイマー開始時刻。デフォルトでは直前とする（30秒制限が即座に有効になるため、
-            # リセット時にも再計算されるロジックを用意するため）
             "timer_start": time.time() 
         }
 
@@ -87,20 +85,21 @@ def webhook():
 
     # ★★ 要件2の修正：30秒経過判定ロジックの強化 ★★
     # もし経過時間が 30 秒を超えている場合、キャンセル処理を行う
-    # (29.5秒など少し余裕を持たせておくのが安全ですが、今回は「29.0」から開始してカウントアップする仕様と仮定)
+    # (29.5秒など少し余裕を持たせておくのが安全ですが、今回は「30秒」を基準とします)
     if elapsed_time >= 30.0: 
-        cancel_reply(user_id, reply_token, "入力をキャンセルしました（時間切れ）。もう一度任意の文字を入力してください。")
+        # デバッグログ：なぜキャンセルされたか表示（Logs で確認可能）
+        print(f"[CANCEL-ELAPSED] User {user_id} cancelled after {elapsed_time:.2f}s (Step: {step})")
+        cancel_reply(user_id, reply_token)
         return Response("OK", status=200)
 
     # ★★ 要件3：「0」入力によるキャンセル処理 ★★
-    # 【重要】「0」が入力されたら、即座にキャンセルし、ステップをリセットする
     if text == "0":
-        cancel_reply(user_id, reply_token, "入力をキャンセルしました（'0'と入力されました）。もう一度任意の文字を入力してください。")
+        print(f"[CANCEL-ZERO] User {user_id} cancelled by input '0' (Step: {step})")
+        cancel_reply(user_id, reply_token)
         return Response("OK", status=200)
 
     # --- ここから通常のステップ処理 ---
     
-    # タイマー更新ロジック：各ステップで必ずこのタイミングで最新時刻を更新する
     def update_timer():
         user_state[user_id]["timer_start"] = time.time()
 
@@ -156,7 +155,8 @@ def webhook():
         
         # ここで再度「0」チェックを入れる（防御策）
         if text == "0":
-            cancel_reply(user_id, reply_token, "入力をキャンセルしました（'0'と入力されました）。")
+            print(f"[CANCEL-ZERO] User {user_id} cancelled by input '0' (Step: usage)")
+            cancel_reply(user_id, reply_token)
             return Response("OK", status=200)
 
     # 5. 完了後 (step: completed)
@@ -200,10 +200,14 @@ def webhook():
 
     return Response("OK", status=200)
 
-def cancel_reply(user_id, reply_token, message):
+def cancel_reply(user_id, reply_token):
     """キャンセルメッセージを送信する関数"""
     # 要求通り「入力をキャンセルしました」と表示し、処理を終了（リセット）
-    # タイマーも直前として設定して、即座に再度文字入力を受け付けるようにする
+    message = "入力をキャンセルしました。もう一度任意の文字を入力してください。"
+    
+    print(f"[CANCEL-SUCCESS] User {user_id} cancelled with message: {message}")
+    
+    # タイマーを直前として設定して、即座に再度文字入力を受け付けるようにする
     user_state[user_id] = {
         "step": "payer", 
         "data": {},
